@@ -42,7 +42,7 @@ use std::{
 /// {
 ///     let x = x.clone();
 ///     thread::spawn(move || {
-///         x.swap(b, Ordering::AcqRel) // Returns `a`
+///         x.swap(Some(b), Ordering::AcqRel) // Returns `a`
 ///     });
 /// }
 /// {
@@ -71,49 +71,72 @@ impl<T> AtomicArc<T> {
     ///
     /// The fast path uses just one atomic operation to load the [`Arc`] and
     /// increase its reference count.
-    pub fn load(&self, order: Ordering) -> Arc<T> {
+    ///
+    /// Returns [`None`] if the pointer is null.
+    pub fn load(&self, order: Ordering) -> Option<Arc<T>> {
         let state = self.state.fetch_add(1, order);
         let (addr, count) = unpack_state(state);
+        if addr == 0 {
+            return None;
+        }
         if count >= RESERVED_COUNT {
             panic!("external reference count overflow");
         }
         if count >= RESERVED_COUNT / 2 {
             self.push_count(addr);
         }
-        unsafe { Arc::from_raw(addr as _) }
+        Some(unsafe { Arc::from_raw(addr as _) })
     }
 
     /// Stores an [`Arc`] into the pointer, returning the previous [`Arc`].
-    pub fn swap(&self, value: Arc<T>, order: Ordering) -> Arc<T> {
-        let state = self.state.swap(new_state(value), order);
+    pub fn swap(&self, value: Option<Arc<T>>, order: Ordering) -> Option<Arc<T>> {
+        let state = self.state.swap(value.map(new_state).unwrap_or(0), order);
         let (addr, count) = unpack_state(state);
+        if addr == 0 {
+            return None;
+        }
         unsafe {
             decrease_count::<T>(addr, RESERVED_COUNT - count);
-            Arc::from_raw(addr as _)
+            Some(Arc::from_raw(addr as _))
         }
     }
 
     /// Pushes the external reference count back to the original [`Arc`].
     fn push_count(&self, expect_addr: usize) {
-        let mut state = self.state.load(Ordering::Acquire);
-        let new_state = pack_state(expect_addr);
+        let mut current = self.state.load(Ordering::Acquire);
+        let desired = pack_state(expect_addr);
         loop {
-            let (addr, count) = unpack_state(state);
+            let (addr, count) = unpack_state(current);
             if addr != expect_addr || count < RESERVED_COUNT / 2 {
                 // Someone else has changed the address or the reference count.
                 break;
             }
             match self.state.compare_exchange_weak(
-                state,
-                new_state,
+                current,
+                desired,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => unsafe {
                     increase_count::<T>(addr, count);
                 },
-                Err(actual) => state = actual,
+                Err(actual) => current = actual,
             }
+        }
+    }
+}
+
+impl<T> Drop for AtomicArc<T> {
+    fn drop(&mut self) {
+        self.swap(None, Ordering::AcqRel);
+    }
+}
+
+impl<T> Default for AtomicArc<T> {
+    fn default() -> Self {
+        Self {
+            state: AtomicU64::new(0),
+            phantom: PhantomData,
         }
     }
 }
@@ -172,16 +195,35 @@ mod tests {
 
     #[test]
     fn simple() {
-        let x = AtomicArc::new(Arc::new(1234));
-        let a = x.load(Ordering::Acquire);
-        assert_eq!(*a, 1234);
-        assert_eq!(Arc::strong_count(&a), RESERVED_COUNT + 1);
-        let b = x.swap(Arc::new(5678), Ordering::AcqRel);
-        assert_eq!(Arc::strong_count(&a), 2);
-        assert_eq!(Arc::strong_count(&b), 2);
-        let c = x.load(Ordering::Acquire);
-        assert_eq!(*c, 5678);
-        assert_eq!(Arc::strong_count(&c), RESERVED_COUNT + 1);
+        let a = Arc::new(1);
+        let b = Arc::new(2);
+        let x = AtomicArc::new(a.clone());
+        {
+            let c = x.load(Ordering::Acquire).unwrap();
+            assert_eq!(c, a);
+            assert_eq!(Arc::strong_count(&c), RESERVED_COUNT + 2);
+        }
+        {
+            let c = x.swap(Some(b.clone()), Ordering::AcqRel).unwrap();
+            assert_eq!(c, a);
+            assert_eq!(Arc::strong_count(&c), 2);
+        }
+        {
+            let c = x.load(Ordering::Acquire).unwrap();
+            assert_eq!(c, b);
+            assert_eq!(Arc::strong_count(&c), RESERVED_COUNT + 2);
+        }
+    }
+
+    #[test]
+    fn option() {
+        let x = AtomicArc::default();
+        assert!(x.load(Ordering::Acquire).is_none());
+        let a = Arc::new(1);
+        assert!(x.swap(Some(a.clone()), Ordering::AcqRel).is_none());
+        let b = x.swap(None, Ordering::AcqRel).unwrap();
+        assert_eq!(b, a);
+        assert!(x.load(Ordering::Acquire).is_none());
     }
 
     #[test]
@@ -189,14 +231,14 @@ mod tests {
         let x = AtomicArc::new(Arc::new(1));
         let mut v = Vec::new();
         for _ in 0..(RESERVED_COUNT / 2) {
-            let a = x.load(Ordering::Relaxed);
+            let a = x.load(Ordering::Relaxed).unwrap();
             assert_eq!(Arc::strong_count(&a), RESERVED_COUNT + 1);
             v.push(a);
         }
         // This load will push the external count back to the `Arc`.
-        let a = x.load(Ordering::Relaxed);
+        let a = x.load(Ordering::Relaxed).unwrap();
         assert_eq!(Arc::strong_count(&a), RESERVED_COUNT + v.len() + 2);
-        let b = x.swap(Arc::new(2), Ordering::Relaxed);
+        let b = x.swap(Some(Arc::new(2)), Ordering::Relaxed).unwrap();
         assert_eq!(Arc::strong_count(&b), v.len() + 2);
     }
 }
