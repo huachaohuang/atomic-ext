@@ -88,7 +88,7 @@ impl<T> AtomicArc<T> {
         Some(unsafe { Arc::from_raw(addr as _) })
     }
 
-    /// Stores an [`Arc`] into the pointer, returning the previous [`Arc`].
+    /// Stores an [`Arc`] into the pointer, returning the previous value.
     pub fn swap(&self, value: Option<Arc<T>>, order: Ordering) -> Option<Arc<T>> {
         let state = self.state.swap(value.map(new_state).unwrap_or(0), order);
         let (addr, count) = unpack_state(state);

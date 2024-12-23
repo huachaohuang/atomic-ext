@@ -14,5 +14,5 @@ use atomic_ext::AtomicArc;
 let a = Arc::new(1);
 let x = AtomicArc::new(a);
 let b = x.load(Ordering::Acquire);
-let c = x.swap(Arc::new(2), Ordering::AcqRel);
+let c = x.swap(Some(Arc::new(2)), Ordering::AcqRel);
 ```
