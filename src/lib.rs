@@ -9,12 +9,56 @@ use std::{
     },
 };
 
+/// A lightweight atomic pointer to [`Arc`].
+///
+/// **Note**: The imlementation manipuates the internal reference count of the
+/// original [`Arc`] for optimization. This means that the result of
+/// [`Arc::strong_count`] is incorrect, until the [`Arc`] gets rid of
+/// this pointer's control (with [`AtomicArc::swap`]). Users who depend on the
+/// correctness of [`Arc::strong_count`] should be careful.
+///
+/// # Limitations
+///
+/// The implementation borrows some bits from the `Arc` pointer as an external
+/// reference count (a technique called "split reference counting"). It
+/// will panic in some extreame scenario when the reference count is increased
+/// more than a threshold (2^15) at the same time. This is almost impossible
+/// unless someone creates more than 2^15 threads to load the same pointer at
+/// the same time.
+///
+/// # Examples
+///
+/// ```
+/// use std::{
+///     sync::{atomic::Ordering, Arc},
+///     thread,
+/// };
+///
+/// use atomic_ext::AtomicArc;
+///
+/// let a = Arc::new(1);
+/// let b = Arc::new(2);
+/// let x = Arc::new(AtomicArc::new(a));
+/// {
+///     let x = x.clone();
+///     thread::spawn(move || {
+///         x.swap(b, Ordering::AcqRel) // Returns `a`
+///     });
+/// }
+/// {
+///     let x = x.clone();
+///     thread::spawn(move || {
+///         x.load(Ordering::Acquire) // Returns either `a` or `b`
+///     });
+/// };
+/// ```
 pub struct AtomicArc<T> {
     state: AtomicU64,
     phantom: PhantomData<*mut Arc<T>>,
 }
 
 impl<T> AtomicArc<T> {
+    /// Constructs a new [`AtomicArc`].
     pub fn new(value: Arc<T>) -> Self {
         let state = new_state(value);
         Self {
@@ -23,40 +67,23 @@ impl<T> AtomicArc<T> {
         }
     }
 
+    /// Loads an [`Arc`] from the pointer.
+    ///
+    /// The fast path uses just one atomic operation to load the [`Arc`] and
+    /// increase its reference count.
     pub fn load(&self, order: Ordering) -> Arc<T> {
-        let mut state = self.state.fetch_add(1, order);
-        let (addr, mut count) = unpack_state(state);
-        if count > RESERVED_COUNT {
+        let state = self.state.fetch_add(1, order);
+        let (addr, count) = unpack_state(state);
+        if count >= RESERVED_COUNT {
             panic!("external reference count overflow");
         }
-        if count > RESERVED_COUNT / 2 {
-            // Push the external reference count back
-            let new_state = pack_state(addr);
-            loop {
-                match self.state.compare_exchange_weak(
-                    state,
-                    new_state,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => unsafe {
-                        increase_count::<T>(addr, count);
-                    },
-                    Err(new_state) => {
-                        let (new_addr, new_count) = unpack_state(new_state);
-                        if new_addr != addr || new_count < RESERVED_COUNT / 2 {
-                            // Someone else has changed the address or the reference count.
-                            break;
-                        }
-                        state = new_state;
-                        count = new_count;
-                    }
-                }
-            }
+        if count >= RESERVED_COUNT / 2 {
+            self.push_count(addr);
         }
         unsafe { Arc::from_raw(addr as _) }
     }
 
+    /// Stores an [`Arc`] into the pointer, returning the previous [`Arc`].
     pub fn swap(&self, value: Arc<T>, order: Ordering) -> Arc<T> {
         let state = self.state.swap(new_state(value), order);
         let (addr, count) = unpack_state(state);
@@ -65,7 +92,34 @@ impl<T> AtomicArc<T> {
             Arc::from_raw(addr as _)
         }
     }
+
+    /// Pushes the external reference count back to the original [`Arc`].
+    fn push_count(&self, expect_addr: usize) {
+        let mut state = self.state.load(Ordering::Acquire);
+        let new_state = pack_state(expect_addr);
+        loop {
+            let (addr, count) = unpack_state(state);
+            if addr != expect_addr || count < RESERVED_COUNT / 2 {
+                // Someone else has changed the address or the reference count.
+                break;
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                new_state,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => unsafe {
+                    increase_count::<T>(addr, count);
+                },
+                Err(actual) => state = actual,
+            }
+        }
+    }
 }
+
+unsafe impl<T> Sync for AtomicArc<T> {}
+unsafe impl<T> Send for AtomicArc<T> {}
 
 const RESERVED_COUNT: usize = 0x8000;
 
@@ -117,12 +171,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test() {
-        let x = AtomicArc::new(Arc::new(1));
+    fn simple() {
+        let x = AtomicArc::new(Arc::new(1234));
         let a = x.load(Ordering::Acquire);
+        assert_eq!(*a, 1234);
         assert_eq!(Arc::strong_count(&a), RESERVED_COUNT + 1);
-        let b = x.swap(Arc::new(2), Ordering::AcqRel);
+        let b = x.swap(Arc::new(5678), Ordering::AcqRel);
         assert_eq!(Arc::strong_count(&a), 2);
         assert_eq!(Arc::strong_count(&b), 2);
+        let c = x.load(Ordering::Acquire);
+        assert_eq!(*c, 5678);
+        assert_eq!(Arc::strong_count(&c), RESERVED_COUNT + 1);
+    }
+
+    #[test]
+    fn push_count() {
+        let x = AtomicArc::new(Arc::new(1));
+        let mut v = Vec::new();
+        for _ in 0..(RESERVED_COUNT / 2) {
+            let a = x.load(Ordering::Relaxed);
+            assert_eq!(Arc::strong_count(&a), RESERVED_COUNT + 1);
+            v.push(a);
+        }
+        // This load will push the external count back to the `Arc`.
+        let a = x.load(Ordering::Relaxed);
+        assert_eq!(Arc::strong_count(&a), RESERVED_COUNT + v.len() + 2);
+        let b = x.swap(Arc::new(2), Ordering::Relaxed);
+        assert_eq!(Arc::strong_count(&b), v.len() + 2);
     }
 }
