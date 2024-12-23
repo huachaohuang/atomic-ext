@@ -2,9 +2,13 @@
 
 [![docs](https://docs.rs/atomic-ext/badge.svg)](https://docs.rs/arc-ext)
 
-## [AtomicArc](https://docs.rs/atomic-ext/latest/atomic_ext/struct.AtomicArc.html): A lightweight atomic pointer to `Arc`.
+## AtomicArc
 
-Example
+[AtomicArc](https://docs.rs/atomic-ext/latest/atomic_ext/struct.AtomicArc.html) is a lightweight atomic pointer to `Arc`.
+
+The implementation is based on "split reference counting", which has similar performance with `Arc`.
+
+### Example
 
 ```rust
 use std::sync::{atomic::Ordering, Arc},
