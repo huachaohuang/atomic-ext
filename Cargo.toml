@@ -2,5 +2,8 @@
 name = "atomic-ext"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+homepage = "https://github.com/huachaohuang/atomic-ext"
+description = "Atomic extensions"
 
 [dependencies]
