@@ -1,6 +1,5 @@
 use std::{
     alloc::Layout,
-    cmp::max,
     marker::PhantomData,
     ptr,
     ptr::NonNull,
@@ -10,6 +9,7 @@ use std::{
     },
 };
 
+/// A raw atomic pointer.
 struct AtomicPtr<T> {
     state: AtomicU64,
     phantom: PhantomData<Arc<T>>,
@@ -112,6 +112,7 @@ impl<T> Drop for AtomicPtr<T> {
         let state = self.state.load(Ordering::Acquire);
         let (addr, count) = unpack_state(state);
         unsafe {
+            // +1 to drop the reference this pionter holds when it is created.
             decrease_count::<T>(addr, RESERVED_COUNT + 1 - count);
         }
     }
@@ -128,7 +129,7 @@ impl<T> Default for AtomicPtr<T> {
 
 /// An atomic pointer for [`Arc`].
 ///
-/// **Note**: The imlementation manipuates the internal reference count of the
+/// **Note**: The implementation manipulates the internal reference count of the
 /// original [`Arc`] for optimization. This means that the result of
 /// [`Arc::strong_count`] is incorrect, until the [`Arc`] gets rid of
 /// this pointer's control (with [`AtomicArc::swap`]). Users who depend on the
@@ -138,7 +139,7 @@ impl<T> Default for AtomicPtr<T> {
 ///
 /// The implementation borrows some bits from the `Arc` pointer as an external
 /// reference count (a technique called "split reference counting"). It
-/// will panic in some extreame scenario when the reference count is increased
+/// will panic in some extreme scenario when the reference count is increased
 /// more than a threshold (2^15) at the same time. This is almost impossible
 /// unless someone creates more than 2^15 threads to load the same pointer at
 /// the same time.
@@ -302,9 +303,8 @@ struct ArcInner {
 }
 
 unsafe fn inner_ptr<T>(addr: usize) -> NonNull<ArcInner> {
-    let align = align_of::<T>();
     let layout = Layout::new::<ArcInner>();
-    let offset = max(layout.size(), align);
+    let (_, offset) = layout.extend(Layout::new::<T>()).unwrap();
     NonNull::new_unchecked((addr - offset) as _)
 }
 
