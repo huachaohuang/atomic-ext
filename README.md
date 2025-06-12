@@ -16,7 +16,12 @@ use std::sync::{atomic::Ordering, Arc},
 use atomic_ext::AtomicArc;
 
 let a = Arc::new(1);
+let b = Arc::new(2);
 let x = AtomicArc::new(a);
-let b = x.load(Ordering::Acquire);
-let c = x.swap(Some(Arc::new(2)), Ordering::AcqRel);
+let c = x.load(Ordering::Acquire);
+assert_eq!(c, a);
+let c = x.swap(b, Ordering::AcqRel);
+assert_eq!(c, a);
+let c = x.load(Ordering::Acquire);
+assert_eq!(c, b);
 ```
