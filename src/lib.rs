@@ -29,9 +29,6 @@ impl<T> AtomicPtr<T> {
     fn load(&self, order: Ordering) -> *const T {
         let state = self.state.fetch_add(1, order);
         let (addr, count) = unpack_state(state);
-        if addr == 0 {
-            return ptr::null();
-        }
         if count >= RESERVED_COUNT {
             panic!("external reference count overflow");
         }
@@ -41,16 +38,47 @@ impl<T> AtomicPtr<T> {
         addr as _
     }
 
-    /// Stores an [`Arc`] pointer, returning the previous pointer.
+    /// Stores an [`Arc`] pointer and returns the previous pointer.
     fn swap(&self, value: *const T, order: Ordering) -> *const T {
         let state = self.state.swap(new_state(value), order);
         let (addr, count) = unpack_state(state);
-        if addr == 0 {
-            return ptr::null();
-        }
         unsafe {
             decrease_count::<T>(addr, RESERVED_COUNT - count);
             addr as _
+        }
+    }
+
+    /// Stores an [`Arc`] pointer if the current value is the same as `current`.
+    fn compare_exchange(
+        &self,
+        current: *const T,
+        new: *const T,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<*const T, *const T> {
+        let new_state = pack_state(new.addr());
+        let mut state = self.state.load(failure);
+        loop {
+            let (addr, count) = unpack_state(state);
+            if addr != current.addr() {
+                unsafe {
+                    increase_count::<T>(addr, 1);
+                }
+                return Err(addr as _);
+            }
+            match self
+                .state
+                .compare_exchange_weak(state, new_state, success, failure)
+            {
+                Ok(_) => {
+                    unsafe {
+                        decrease_count::<T>(addr, RESERVED_COUNT - count);
+                        increase_count::<T>(new.addr(), RESERVED_COUNT + 1);
+                    }
+                    return Ok(addr as _);
+                }
+                Err(now_state) => state = now_state,
+            }
         }
     }
 
@@ -67,7 +95,7 @@ impl<T> AtomicPtr<T> {
             match self.state.compare_exchange_weak(
                 current,
                 desired,
-                Ordering::AcqRel,
+                Ordering::Release,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => unsafe {
@@ -81,7 +109,11 @@ impl<T> AtomicPtr<T> {
 
 impl<T> Drop for AtomicPtr<T> {
     fn drop(&mut self) {
-        self.swap(ptr::null(), Ordering::AcqRel);
+        let state = self.state.load(Ordering::Acquire);
+        let (addr, count) = unpack_state(state);
+        unsafe {
+            decrease_count::<T>(addr, RESERVED_COUNT + 1 - count);
+        }
     }
 }
 
@@ -157,8 +189,25 @@ impl<T> AtomicArc<T> {
     /// Stores an [`Arc`] into the pointer, returning the previous value.
     pub fn swap(&self, value: Arc<T>, order: Ordering) -> Arc<T> {
         let new = Arc::into_raw(value);
-        let old = self.0.swap(new, order);
-        unsafe { Arc::from_raw(old) }
+        let current = self.0.swap(new, order);
+        unsafe { Arc::from_raw(current) }
+    }
+
+    /// Stores an [`Arc`] into the pointer if the current value is the same as
+    /// `current`.
+    pub fn compare_exchange(
+        &self,
+        current: &Arc<T>,
+        new: &Arc<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Arc<T>, Arc<T>> {
+        let new = Arc::as_ptr(new);
+        let current = Arc::as_ptr(current);
+        self.0
+            .compare_exchange(current, new, success, failure)
+            .map(|ptr| unsafe { Arc::from_raw(ptr) })
+            .map_err(|ptr| unsafe { Arc::from_raw(ptr) })
     }
 }
 
@@ -178,21 +227,42 @@ impl<T> AtomicOptionArc<T> {
     /// Returns [`None`] if the pointer is null.
     pub fn load(&self, order: Ordering) -> Option<Arc<T>> {
         let ptr = self.0.load(order);
-        if ptr.is_null() {
-            None
-        } else {
-            Some(unsafe { Arc::from_raw(ptr) })
-        }
+        unsafe { Self::from_ptr(ptr) }
     }
 
     /// Stores an [`Arc`] into the pointer, returning the previous value.
     pub fn swap(&self, value: Option<Arc<T>>, order: Ordering) -> Option<Arc<T>> {
-        let new = value.map(Arc::into_raw).unwrap_or(ptr::null());
-        let old = self.0.swap(new, order);
-        if old.is_null() {
+        let new = Self::into_ptr(value);
+        let current = self.0.swap(new, order);
+        unsafe { Self::from_ptr(current) }
+    }
+
+    /// Stores an [`Arc`] into the pointer if the current value is the same as
+    /// `current`.
+    pub fn compare_exchange(
+        &self,
+        current: Option<&Arc<T>>,
+        new: Option<&Arc<T>>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Option<Arc<T>>, Option<Arc<T>>> {
+        let new = new.map(Arc::as_ptr).unwrap_or(ptr::null());
+        let current = current.map(Arc::as_ptr).unwrap_or(ptr::null());
+        self.0
+            .compare_exchange(current, new, success, failure)
+            .map(|ptr| unsafe { Self::from_ptr(ptr) })
+            .map_err(|ptr| unsafe { Self::from_ptr(ptr) })
+    }
+
+    fn into_ptr(value: Option<Arc<T>>) -> *const T {
+        value.map(Arc::into_raw).unwrap_or(ptr::null())
+    }
+
+    unsafe fn from_ptr(ptr: *const T) -> Option<Arc<T>> {
+        if ptr.is_null() {
             None
         } else {
-            Some(unsafe { Arc::from_raw(old) })
+            Some(unsafe { Arc::from_raw(ptr) })
         }
     }
 }
@@ -206,9 +276,6 @@ impl<T> Default for AtomicOptionArc<T> {
 const RESERVED_COUNT: usize = 0x8000;
 
 fn new_state<T>(ptr: *const T) -> u64 {
-    if ptr.is_null() {
-        return 0;
-    }
     let addr = ptr.addr();
     unsafe {
         increase_count::<T>(addr, RESERVED_COUNT);
@@ -242,13 +309,17 @@ unsafe fn inner_ptr<T>(addr: usize) -> NonNull<ArcInner> {
 }
 
 unsafe fn increase_count<T>(addr: usize, count: usize) {
-    let ptr = inner_ptr::<T>(addr);
-    ptr.as_ref().count.fetch_add(count, Ordering::Release);
+    if addr != 0 {
+        let ptr = inner_ptr::<T>(addr);
+        ptr.as_ref().count.fetch_add(count, Ordering::Release);
+    }
 }
 
 unsafe fn decrease_count<T>(addr: usize, count: usize) {
-    let ptr = inner_ptr::<T>(addr);
-    ptr.as_ref().count.fetch_sub(count, Ordering::Release);
+    if addr != 0 {
+        let ptr = inner_ptr::<T>(addr);
+        ptr.as_ref().count.fetch_sub(count, Ordering::Release);
+    }
 }
 
 #[cfg(test)]
@@ -263,18 +334,33 @@ mod tests {
         {
             let c = x.load(Ordering::Acquire);
             assert_eq!(c, a);
-            assert_eq!(Arc::strong_count(&c), RESERVED_COUNT + 2);
+            assert_eq!(Arc::strong_count(&a), RESERVED_COUNT + 2);
         }
         {
             let c = x.swap(b.clone(), Ordering::AcqRel);
             assert_eq!(c, a);
-            assert_eq!(Arc::strong_count(&c), 2);
-        }
-        {
+            assert_eq!(Arc::strong_count(&a), 2);
+            assert_eq!(Arc::strong_count(&b), RESERVED_COUNT + 2);
             let c = x.load(Ordering::Acquire);
             assert_eq!(c, b);
-            assert_eq!(Arc::strong_count(&c), RESERVED_COUNT + 2);
+            assert_eq!(Arc::strong_count(&b), RESERVED_COUNT + 2);
         }
+        {
+            let c = x
+                .compare_exchange(&b, &a, Ordering::AcqRel, Ordering::Acquire)
+                .unwrap();
+            assert_eq!(c, b);
+            assert_eq!(Arc::strong_count(&b), 2);
+            assert_eq!(Arc::strong_count(&a), RESERVED_COUNT + 2);
+            let c = x
+                .compare_exchange(&b, &a, Ordering::AcqRel, Ordering::Acquire)
+                .unwrap_err();
+            assert_eq!(c, a);
+            assert_eq!(Arc::strong_count(&a), RESERVED_COUNT + 3);
+        }
+        drop(x);
+        assert_eq!(Arc::strong_count(&a), 1);
+        assert_eq!(Arc::strong_count(&b), 1);
     }
 
     #[test]
@@ -282,10 +368,29 @@ mod tests {
         let a = Arc::new(1);
         let b = Arc::new(2);
         let x = AtomicOptionArc::new(a.clone());
-        assert_eq!(x.load(Ordering::Acquire), Some(a.clone()));
-        assert_eq!(x.swap(Some(b.clone()), Ordering::AcqRel), Some(a.clone()));
-        assert_eq!(x.swap(None, Ordering::AcqRel), Some(b.clone()));
+        {
+            let c = x.load(Ordering::Acquire);
+            assert_eq!(c, Some(a.clone()));
+        }
+        {
+            let c = x.swap(Some(b.clone()), Ordering::AcqRel);
+            assert_eq!(c, Some(a.clone()));
+            let c = x.load(Ordering::Acquire);
+            assert_eq!(c, Some(b.clone()));
+        }
+        {
+            let c = x
+                .compare_exchange(Some(&b), None, Ordering::AcqRel, Ordering::Relaxed)
+                .unwrap();
+            assert_eq!(c, Some(b.clone()));
+            let c = x
+                .compare_exchange(Some(&b), None, Ordering::AcqRel, Ordering::Relaxed)
+                .unwrap_err();
+            assert_eq!(c, None);
+        }
         assert_eq!(x.load(Ordering::Acquire), None);
+        assert_eq!(Arc::strong_count(&a), 1);
+        assert_eq!(Arc::strong_count(&b), 1);
     }
 
     #[test]
