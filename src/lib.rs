@@ -25,6 +25,14 @@ impl<T> AtomicPtr<T> {
         }
     }
 
+    /// Returns a null pointer.
+    const fn null() -> Self {
+        Self {
+            state: AtomicU64::new(0),
+            phantom: PhantomData,
+        }
+    }
+
     /// Loads an [`Arc`] pointer.
     fn load(&self, order: Ordering) -> *const T {
         let state = self.state.fetch_add(1, order);
@@ -223,6 +231,11 @@ impl<T> AtomicOptionArc<T> {
         Self(AtomicPtr::new(Arc::into_raw(value)))
     }
 
+    /// Returns a null pointer.
+    pub const fn null() -> Self {
+        Self(AtomicPtr::null())
+    }
+
     /// Loads an [`Arc`] from the pointer.
     ///
     /// Returns [`None`] if the pointer is null.
@@ -270,7 +283,7 @@ impl<T> AtomicOptionArc<T> {
 
 impl<T> Default for AtomicOptionArc<T> {
     fn default() -> Self {
-        Self(AtomicPtr::new(ptr::null()))
+        Self::null()
     }
 }
 
